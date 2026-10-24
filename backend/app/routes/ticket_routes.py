@@ -1,11 +1,10 @@
 from fastapi import APIRouter, HTTPException, Header, Query
-from google.api_core.exceptions import ResourceExhausted
 from app.schemas import TicketRequest
 from app.llm.priority_agent import prioritize_tasks
 from app.routes.auth_routes import verify_token
 from app.database import boards_collection
-import re
-import json
+from app.permissions import require_member
+from app.services.dependency_service import validate_tickets
 
 router = APIRouter()
 
@@ -14,25 +13,25 @@ router = APIRouter()
 def create_tickets(data: TicketRequest, workspace_id: str = Query(...), authorization: str = Header(None)):
     user = verify_token(authorization)
     user_id = user["user_id"]
+    require_member(workspace_id, user_id)
+
+    tickets = [ticket.model_dump() for ticket in data.tickets]
+    for t in tickets:
+        t["priority"] = t["priority"].strip().lower()
+
+    error = validate_tickets(tickets)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
 
     try:
-        tickets = [ticket.dict() for ticket in data.tickets]
+        execution_order = prioritize_tasks(tickets)
 
-        order = prioritize_tasks(tickets)
-
-        try:
-            parsed_order = json.loads(order)
-        except:
-            match = re.search(r'\{.*\}', order, re.DOTALL)
-            if match:
-                parsed_order = json.loads(match.group())
-            else:
-                parsed_order = {"execution_order": []}
-
-        execution_order = parsed_order.get("execution_order", [])
-
-        # Initialize all tickets in "created" column
-        columns = {str(t["id"]): "created" for t in tickets}
+        # Keep the column of tickets that were already on the board; new ones start in "created"
+        existing = boards_collection.find_one({"workspace_id": workspace_id, "user_id": user_id}) or {}
+        old_columns = existing.get("columns", {})
+        columns = {str(t["id"]): old_columns.get(str(t["id"]), "created") for t in tickets}
+        for t in tickets:
+            t["status"] = columns[str(t["id"])]
 
         # Save to MongoDB under workspace + user
         boards_collection.update_one(
@@ -50,13 +49,8 @@ def create_tickets(data: TicketRequest, workspace_id: str = Query(...), authoriz
         return {
             "message": "Tickets received",
             "execution_order": execution_order,
+            "columns": columns,
         }
-
-    except ResourceExhausted:
-        raise HTTPException(
-            status_code=429,
-            detail="AI quota exceeded. Please wait a moment and try again."
-        )
 
     except Exception as e:
         print(f"[Unexpected Error] {e}")
@@ -69,31 +63,15 @@ def get_board(workspace_id: str = Query(...), user_id: str = Query(None), author
     user = verify_token(authorization)
     target_user_id = user_id or user["user_id"]
 
+    # Both the viewer and the board owner must belong to the workspace
+    workspace = require_member(workspace_id, user["user_id"])
+    if target_user_id not in workspace.get("members", []):
+        raise HTTPException(status_code=404, detail="User is not in this workspace")
+
     board = boards_collection.find_one(
         {"workspace_id": workspace_id, "user_id": target_user_id},
         {"_id": 0}
-    )
-
-    if not board:
-        # Fallback: check for legacy board without user_id
-        if not user_id:
-            legacy = boards_collection.find_one(
-                {"workspace_id": workspace_id, "user_id": {"$exists": False}},
-                {"_id": 0}
-            )
-            if legacy:
-                # Migrate: assign this legacy board to the current user
-                boards_collection.update_one(
-                    {"workspace_id": workspace_id, "user_id": {"$exists": False}},
-                    {"$set": {"user_id": user["user_id"]}}
-                )
-                return {
-                    "tickets": legacy.get("tickets", []),
-                    "columns": legacy.get("columns", {}),
-                    "execution_order": legacy.get("execution_order", []),
-                    "is_own_board": True,
-                }
-        return {"tickets": [], "columns": {}, "execution_order": [], "is_own_board": target_user_id == user["user_id"]}
+    ) or {}
 
     return {
         "tickets": board.get("tickets", []),
@@ -108,6 +86,7 @@ def clear_board(workspace_id: str = Query(...), authorization: str = Header(None
     """Clear the current user's board data for the workspace."""
     user = verify_token(authorization)
     user_id = user["user_id"]
+    require_member(workspace_id, user_id)
 
     boards_collection.delete_one({"workspace_id": workspace_id, "user_id": user_id})
 
