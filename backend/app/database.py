@@ -28,11 +28,13 @@ workspaces_collection.create_index("name")
 invitations_collection.create_index("to_user_id")
 
 # Seed admin user
-ADMIN_EMAIL = "admin123@gmail.com"
-ADMIN_PASSWORD = "admin123@"
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
-existing_admin = users_collection.find_one({"email": ADMIN_EMAIL})
-if not existing_admin:
+existing_admin = users_collection.find_one({"email": ADMIN_EMAIL}) if ADMIN_EMAIL else None
+if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+    print("[DB] ADMIN_EMAIL / ADMIN_PASSWORD not set — skipping admin seed")
+elif not existing_admin:
     hashed = bcrypt.hashpw(ADMIN_PASSWORD.encode("utf-8"), bcrypt.gensalt())
     users_collection.insert_one({
         "email": ADMIN_EMAIL,

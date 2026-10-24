@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel
 from bson import ObjectId
 from app.routes.auth_routes import verify_token
-from app.database import users_collection, workspaces_collection, invitations_collection, boards_collection
+from app.database import users_collection, workspaces_collection, invitations_collection, boards_collection, meetings_collection
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -126,7 +126,7 @@ def list_all_workspaces(authorization: str = Header(None)):
 
 @router.delete("/workspaces/{workspace_id}")
 def delete_workspace(workspace_id: str, authorization: str = Header(None)):
-    """Delete a workspace, its board data, and pending invites (admin only)."""
+    """Delete a workspace, its boards, invites and meetings (admin only)."""
     require_admin(authorization)
 
     workspace = workspaces_collection.find_one({"_id": ObjectId(workspace_id)})
@@ -135,8 +135,9 @@ def delete_workspace(workspace_id: str, authorization: str = Header(None)):
 
     ws_name = workspace["name"]
     workspaces_collection.delete_one({"_id": ObjectId(workspace_id)})
-    boards_collection.delete_one({"workspace_id": workspace_id})
+    boards_collection.delete_many({"workspace_id": workspace_id})
     invitations_collection.delete_many({"workspace_id": workspace_id})
+    meetings_collection.delete_many({"workspace_id": workspace_id})
 
     return {"message": f"Workspace '{ws_name}' deleted"}
 

@@ -1,15 +1,6 @@
-import os
-import time
 import json
-from collections import defaultdict, deque
-from dotenv import load_dotenv
-from google import genai
-from google.api_core.exceptions import ResourceExhausted
-
-load_dotenv()
-
-api_key = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=api_key)
+from collections import defaultdict
+from app.llm.mistral_client import generate
 
 
 def local_prioritize(tickets):
@@ -67,20 +58,25 @@ def local_prioritize(tickets):
     return result
 
 
+def is_valid_order(order, tickets):
+    """True if `order` lists every ticket once and puts each ticket after its dependency."""
+    if sorted(order) != sorted(t["id"] for t in tickets):
+        return False
+    pos = {tid: i for i, tid in enumerate(order)}
+    return all(pos[t["id"]] > pos[t["dependency"]] for t in tickets if t.get("dependency"))
+
+
 def prioritize_tasks(tickets):
     """
     Try LLM first, fall back to local topological sort.
+    Returns a list of ticket IDs.
     """
-    max_retries = 3
-
-    for attempt in range(max_retries):
-        try:
-            prompt = f"""
+    prompt = f"""
 You are an AI project manager.
 
 Given the following tickets:
 
-{tickets}
+{json.dumps(tickets)}
 
 Determine the correct execution order based on:
 - dependency
@@ -99,19 +95,12 @@ Return ONLY valid JSON like this:
 Do not include explanation.
 Only return JSON.
 """
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-            )
-            return response.text
 
-        except ResourceExhausted:
-            wait_seconds = 30 * (attempt + 1)
-
-            if attempt < max_retries - 1:
-                print(f"[Quota Exceeded] Retrying in {wait_seconds}s... (attempt {attempt + 1}/{max_retries})")
-                time.sleep(wait_seconds)
-            else:
-                print("[Quota Exceeded] All retries failed. Using local topological sort fallback.")
-                order = local_prioritize(tickets)
-                return json.dumps({"execution_order": order})
+    try:
+        order = json.loads(generate(prompt, json_mode=True)).get("execution_order", [])
+        if is_valid_order(order, tickets):
+            return order
+        print(f"[AI Prioritize] AI order {order} is invalid, using local topological sort")
+    except Exception as e:
+        print(f"[AI Prioritize] Falling back to local topological sort: {e}")
+    return local_prioritize(tickets)

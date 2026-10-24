@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Header
 from bson import ObjectId
 from app.routes.auth_routes import verify_token
 from app.database import workspaces_collection, invitations_collection, users_collection
+from app.permissions import require_member
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 
@@ -12,13 +13,7 @@ def get_workspace_members(workspace_id: str, authorization: str = Header(None)):
     user = verify_token(authorization)
     user_id = user["user_id"]
 
-    workspace = workspaces_collection.find_one({"_id": ObjectId(workspace_id)})
-    if not workspace:
-        raise HTTPException(status_code=404, detail="Workspace not found")
-
-    # Check caller is a member
-    if user_id not in workspace.get("members", []):
-        raise HTTPException(status_code=403, detail="Not a member of this workspace")
+    workspace = require_member(workspace_id, user_id)
 
     # Build member list with emails
     members = []
@@ -29,6 +24,7 @@ def get_workspace_members(workspace_id: str, authorization: str = Header(None)):
                 "id": mid,
                 "email": u["email"],
                 "is_current_user": mid == user_id,
+                "is_admin": bool(u.get("is_admin")),
             })
 
     return {"members": members, "workspace_name": workspace["name"]}

@@ -1,75 +1,35 @@
-from app.services.ticket_service import load_tickets, save_tickets
+VALID_STATUSES = {"created", "pending", "completed", "not_completed"}
 
 
-def update_status(task_id, status):
+def dependency_blocker(ticket, tickets, columns, target_status):
+    """Return the unfinished ticket that blocks moving `ticket` to `target_status`, or None."""
+    if target_status not in ("pending", "completed"):
+        return None
+    dep_id = ticket.get("dependency", 0)
+    if not dep_id or columns.get(str(dep_id)) == "completed":
+        return None
+    return next((t for t in tickets if t["id"] == dep_id), None)
 
-    tickets = load_tickets()
 
+def validate_tickets(tickets):
+    """Return an error message if the ticket list is invalid, else None."""
+    ids = [t["id"] for t in tickets]
+    if len(set(ids)) != len(ids):
+        return "Ticket IDs must be unique"
     for t in tickets:
-        if t["id"] == task_id:
-            t["status"] = status
+        if not t["task"].strip():
+            return f"Ticket #{t['id']} needs a task description"
+        dep = t["dependency"]
+        if dep and dep not in ids:
+            return f"Ticket #{t['id']} depends on #{dep}, which doesn't exist"
 
-    save_tickets(tickets)
-
-    return tickets
-
-
-def find_blocked_tasks(task_id):
-
-    tickets = load_tickets()
-
-    blocked = []
-
-    for t in tickets:
-        if t["dependency"] == task_id:
-            blocked.append(t["id"])
-
-    return blocked
-
-
-def check_dependency(task_id):
-    """Check if a ticket's dependency is completed before allowing completion."""
-    tickets = load_tickets()
-
-    # Find the ticket
-    ticket = None
-    for t in tickets:
-        if t["id"] == task_id:
-            ticket = t
-            break
-
-    if ticket is None:
-        return {"can_complete": False, "error": "Ticket not found"}
-
-    dependency_id = ticket.get("dependency", 0)
-
-    # No dependency — can complete freely
-    if dependency_id == 0:
-        return {"can_complete": True, "dependency_id": 0}
-
-    # Find the dependency ticket
-    dep_ticket = None
-    for t in tickets:
-        if t["id"] == dependency_id:
-            dep_ticket = t
-            break
-
-    if dep_ticket is None:
-        return {"can_complete": True, "dependency_id": dependency_id, "error": "Dependency ticket not found"}
-
-    dep_status = dep_ticket.get("status", "pending")
-
-    if dep_status == "completed":
-        return {
-            "can_complete": True,
-            "dependency_id": dependency_id,
-            "dependency_status": dep_status,
-            "dependency_task": dep_ticket.get("task", ""),
-        }
-    else:
-        return {
-            "can_complete": False,
-            "dependency_id": dependency_id,
-            "dependency_status": dep_status,
-            "dependency_task": dep_ticket.get("task", ""),
-        }
+    # Each ticket has at most one dependency, so follow each chain looking for a loop
+    dep_of = {t["id"]: t["dependency"] for t in tickets}
+    for start in dep_of:
+        seen, cur = set(), start
+        while cur and cur not in seen:
+            seen.add(cur)
+            cur = dep_of.get(cur, 0)
+        if cur:
+            return f"Ticket #{start} is part of a dependency loop"
+    return None

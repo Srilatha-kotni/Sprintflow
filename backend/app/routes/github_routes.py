@@ -1,4 +1,3 @@
-import os
 import json
 import httpx
 from fastapi import APIRouter, HTTPException, Header, Query
@@ -6,13 +5,9 @@ from pydantic import BaseModel
 from typing import Optional, List
 from app.routes.auth_routes import verify_token
 from app.database import users_collection, boards_collection
-
-from google import genai
-from google.api_core.exceptions import ResourceExhausted
-from dotenv import load_dotenv
-
-load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+from app.llm.mistral_client import generate
+from app.permissions import require_member
+from app.services.dependency_service import VALID_STATUSES, dependency_blocker
 
 router = APIRouter(prefix="/github", tags=["github"])
 
@@ -96,6 +91,7 @@ def analyze_commits(
     authorization: str = Header(None),
 ):
     user = verify_token(authorization)
+    require_member(workspace_id, user["user_id"])
     db_user = users_collection.find_one({"email": user["email"]})
 
     if not db_user or not db_user.get("github_pat"):
@@ -198,11 +194,7 @@ Return ONLY valid JSON in this exact format:
 If no matches are found, return {{"matches": [], "summary": "No commits match current tickets."}}.
 Only return JSON, no explanation outside the JSON."""
 
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        raw = response.text.strip()
+        raw = generate(prompt, json_mode=True).strip()
 
         # Parse AI response
         try:
@@ -221,7 +213,7 @@ Only return JSON, no explanation outside the JSON."""
             "ai_summary": parsed.get("summary", ""),
         }
 
-    except (ResourceExhausted, Exception) as e:
+    except Exception as e:
         print(f"[GitHub Analyze] AI failed: {e}")
         return {
             "commits": commits,
@@ -239,6 +231,7 @@ def apply_changes(
     authorization: str = Header(None),
 ):
     user = verify_token(authorization)
+    require_member(workspace_id, user["user_id"])
 
     board = boards_collection.find_one({"workspace_id": workspace_id, "user_id": user["user_id"]})
     if not board:
@@ -246,31 +239,43 @@ def apply_changes(
 
     columns = board.get("columns", {})
     tickets = board.get("tickets", [])
+    by_id = {t["id"]: t for t in tickets}
     applied = []
 
+    # Keep only well-formed changes for tickets that exist
+    pending = []
     for change in data.changes:
-        tid = change.get("ticket_id")
-        new_status = change.get("new_status")
-
-        if not tid or not new_status:
+        try:
+            tid = int(change.get("ticket_id"))
+        except (TypeError, ValueError):
             continue
+        new_status = change.get("new_status")
+        if tid in by_id and new_status in VALID_STATUSES:
+            pending.append((tid, new_status))
 
-        # Update column
-        columns[str(tid)] = new_status
-
-        # Update ticket status in array
-        for t in tickets:
-            if t["id"] == tid:
-                t["status"] = new_status
-
-        applied.append({"ticket_id": tid, "new_status": new_status})
+    # Apply in rounds so one change can unblock another (e.g. #3 completed lets #2 complete)
+    progress = True
+    while pending and progress:
+        progress = False
+        for tid, new_status in list(pending):
+            if dependency_blocker(by_id[tid], tickets, columns, new_status):
+                continue
+            columns[str(tid)] = new_status
+            by_id[tid]["status"] = new_status
+            applied.append({"ticket_id": tid, "new_status": new_status})
+            pending.remove((tid, new_status))
+            progress = True
+    skipped = [{"ticket_id": tid, "new_status": st} for tid, st in pending]
 
     boards_collection.update_one(
         {"workspace_id": workspace_id, "user_id": user["user_id"]},
         {"$set": {"columns": columns, "tickets": tickets}}
     )
 
-    return {"message": f"Applied {len(applied)} change(s)", "applied": applied}
+    message = f"Applied {len(applied)} change(s)"
+    if skipped:
+        message += f", skipped {len(skipped)} blocked by unfinished dependencies"
+    return {"message": message, "applied": applied, "skipped": skipped}
 
 
 # ─── Disconnect ───────────────────────────────────────────────────────────────

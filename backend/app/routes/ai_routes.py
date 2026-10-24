@@ -1,16 +1,11 @@
-import os
 import json
 from datetime import datetime
 from fastapi import APIRouter, Header, Query
 from app.routes.auth_routes import verify_token
-from app.database import boards_collection, users_collection, workspaces_collection
-
-from google import genai
-from google.api_core.exceptions import ResourceExhausted
-from dotenv import load_dotenv
-
-load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+from bson import ObjectId
+from app.database import boards_collection, users_collection
+from app.llm.mistral_client import generate
+from app.permissions import require_member
 
 router = APIRouter(prefix="/ai", tags=["ai"])
 
@@ -75,6 +70,7 @@ def local_standup(tickets, columns):
 def generate_standup(workspace_id: str = Query(...), authorization: str = Header(None)):
     user = verify_token(authorization)
     user_id = user["user_id"]
+    require_member(workspace_id, user_id)
 
     board = boards_collection.find_one({"workspace_id": workspace_id, "user_id": user_id}, {"_id": 0})
     if not board or not board.get("tickets"):
@@ -114,13 +110,10 @@ Generate a concise, professional standup summary with these sections:
 Format in markdown. Keep it concise and actionable. Use ticket numbers (#1, #2, etc).
 Do NOT wrap in code fences. Just return the markdown directly."""
 
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        return {"summary": response.text, "source": "ai"}
+        summary = generate(prompt)
+        return {"summary": summary, "source": "ai"}
 
-    except (ResourceExhausted, Exception) as e:
+    except Exception as e:
         print(f"[AI Standup] Falling back to local: {e}")
         summary = local_standup(tickets, columns)
         return {"summary": summary, "source": "local"}
@@ -198,6 +191,7 @@ def local_risk_analysis(tickets, columns):
 def analyze_risks(workspace_id: str = Query(...), authorization: str = Header(None)):
     user = verify_token(authorization)
     user_id = user["user_id"]
+    require_member(workspace_id, user_id)
 
     board = boards_collection.find_one({"workspace_id": workspace_id, "user_id": user_id}, {"_id": 0})
     if not board or not board.get("tickets"):
@@ -226,14 +220,10 @@ Give a brief, actionable risk assessment in markdown:
 Keep it to 3-5 bullet points maximum. Be direct and specific. Use ticket numbers.
 Do NOT wrap in code fences."""
 
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
-            )
-            ai_summary = response.text
+            ai_summary = generate(prompt)
             source = "ai"
 
-        except (ResourceExhausted, Exception) as e:
+        except Exception as e:
             print(f"[AI Risk] Falling back to local: {e}")
             if risks:
                 lines = ["**⚠️ Risk Assessment:**", ""]
@@ -252,21 +242,15 @@ Do NOT wrap in code fences."""
 def workspace_analytics(workspace_id: str = Query(...), authorization: str = Header(None)):
     """Get aggregated analytics for a workspace — all members' boards combined."""
     user = verify_token(authorization)
+    workspace = require_member(workspace_id, user["user_id"])
 
-    from bson import ObjectId
-
-    workspace = workspaces_collection.find_one({"_id": ObjectId(workspace_id)})
-    if not workspace:
-        return {"error": "Workspace not found"}
-
-    member_ids = workspace.get("members", [])
-
-    # Build email map
+    # Build email map (the admin runs the workspace but has no board, so leave them out)
     email_map = {}
-    for mid in member_ids:
-        u = users_collection.find_one({"_id": ObjectId(mid)}, {"email": 1})
-        if u:
+    for mid in workspace.get("members", []):
+        u = users_collection.find_one({"_id": ObjectId(mid)}, {"email": 1, "is_admin": 1})
+        if u and not u.get("is_admin"):
             email_map[mid] = u["email"]
+    member_ids = list(email_map)
 
     # Aggregate stats across all boards
     status_counts = {"created": 0, "pending": 0, "completed": 0, "not_completed": 0}

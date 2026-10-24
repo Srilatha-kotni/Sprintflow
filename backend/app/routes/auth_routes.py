@@ -8,7 +8,9 @@ from app.database import users_collection
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-JWT_SECRET = os.getenv("JWT_SECRET", "mini-ai-jira-secret-key-2026")
+JWT_SECRET = os.getenv("JWT_SECRET")
+if not JWT_SECRET:
+    raise RuntimeError("JWT_SECRET is not set in backend/.env")
 
 
 class AuthRequest(BaseModel):
@@ -54,7 +56,7 @@ def register(data: AuthRequest):
 
     token = create_token(str(result.inserted_id), data.email)
 
-    return {"message": "Registered successfully", "token": token, "email": data.email}
+    return {"message": "Registered successfully", "token": token, "email": data.email, "is_admin": False}
 
 
 @router.post("/login")
@@ -68,4 +70,4 @@ def login(data: AuthRequest):
 
     token = create_token(str(user["_id"]), data.email)
 
-    return {"message": "Login successful", "token": token, "email": data.email}
+    return {"message": "Login successful", "token": token, "email": data.email, "is_admin": bool(user.get("is_admin"))}

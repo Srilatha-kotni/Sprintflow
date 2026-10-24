@@ -1,28 +1,16 @@
-from fastapi import APIRouter, HTTPException, Header, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Header
 from pydantic import BaseModel
 from bson import ObjectId
 from datetime import datetime
 import re
-import os
-import json
-from google import genai
+import uuid
 from app.routes.auth_routes import verify_token
-from app.database import users_collection, workspaces_collection, meetings_collection, boards_collection
+from app.routes.admin_routes import require_admin
+from app.database import users_collection, workspaces_collection, meetings_collection
+from app.llm.mistral_client import generate
+from app.services.voice_actions import Skip, process_note, public_activity, undo_activity, workspace_lock
 
 router = APIRouter(tags=["meetings"])
-
-# Configure Gemini
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-
-
-# ─── Helpers ──────────────────────────────
-def require_admin(authorization: str):
-    """Verify that the caller is an admin."""
-    user = verify_token(authorization)
-    db_user = users_collection.find_one({"email": user["email"]})
-    if not db_user or not db_user.get("is_admin"):
-        raise HTTPException(status_code=403, detail="Admin access required")
-    return user
 
 
 class CreateMeeting(BaseModel):
@@ -98,7 +86,7 @@ def create_meeting(data: CreateMeeting, authorization: str = Header(None)):
 
 @router.post("/admin/meetings/{meeting_id}/end")
 def end_meeting(meeting_id: str, authorization: str = Header(None)):
-    """End an active meeting, generate AI summary, and auto-create tickets from notes."""
+    """End an active meeting: finish any unprocessed notes, then write the AI summary."""
     require_admin(authorization)
 
     meeting = meetings_collection.find_one({"_id": ObjectId(meeting_id)})
@@ -108,138 +96,30 @@ def end_meeting(meeting_id: str, authorization: str = Header(None)):
     if meeting["status"] != "active":
         raise HTTPException(status_code=400, detail="Meeting is not active")
 
-    # Combine all notes and generate AI summary
+    # Notes are normally turned into board actions live; retry any the AI missed (e.g. rate limit)
+    for note in meeting.get("notes", []):
+        if not note.get("processed") and note.get("id"):
+            process_note(meeting_id, note["id"])
+
+    meeting = meetings_collection.find_one({"_id": ObjectId(meeting_id)})
     notes = meeting.get("notes", [])
+    applied = [a for a in meeting.get("activity", []) if a["status"] == "applied"]
     ai_summary = ""
-    tickets_created = 0
 
     if notes:
-        # Build transcript
-        transcript_lines = []
-        for note in notes:
-            transcript_lines.append(f"[{note['user_email']}] ({note['timestamp']}): {note['text']}")
-        full_transcript = "\n".join(transcript_lines)
-
-        # ── 1. Generate AI summary ──
+        transcript = "\n".join(f"[{n['user_email']}] ({n['timestamp']}): {n['text']}" for n in notes)
+        changes = "\n".join(f"- {a['summary']}" for a in applied) or "(none)"
         summary_prompt = (
             "You are a standup meeting assistant. Summarize this meeting transcript.\n"
-            "Highlight key updates, blockers, and decisions.\n\n"
-            f"Transcript:\n{full_transcript}"
+            "Highlight key updates, blockers, and decisions, then list the board changes that were made.\n\n"
+            f"Transcript:\n{transcript}\n\n"
+            f"Board changes made automatically during the meeting:\n{changes}"
         )
         try:
-            response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=summary_prompt,
-            )
-            ai_summary = response.text
+            ai_summary = generate(summary_prompt)
         except Exception as e:
             print(f"[AI Summary Error] {type(e).__name__}: {e}")
             ai_summary = "AI summary could not be generated."
-
-        # ── 2. Extract action items per user and auto-create tickets ──
-        # Build a user_id -> email mapping from notes
-        user_map = {}
-        for note in notes:
-            uid = note.get("user_id")
-            if uid and uid not in user_map:
-                user_map[uid] = note["user_email"]
-
-        extraction_prompt = (
-            "You are a project management assistant. Analyze these standup meeting notes "
-            "and extract specific ACTION ITEMS (tasks that someone committed to doing).\n\n"
-            "Rules:\n"
-            "- Only extract tasks that a person said THEY WILL DO (commitments, not updates about past work)\n"
-            "- Assign a priority: high, medium, or low\n"
-            "- Ignore greetings, status updates about completed work, and general chat\n"
-            "- If no action items exist for a user, omit them\n\n"
-            f"Participant mapping (user_id -> email):\n"
-        )
-        for uid, email in user_map.items():
-            extraction_prompt += f"  {uid} = {email}\n"
-
-        extraction_prompt += (
-            f"\nTranscript:\n{full_transcript}\n\n"
-            "Return ONLY valid JSON (no markdown, no explanation) in this exact format:\n"
-            '{"action_items": {"<user_id>": [{"task": "...", "priority": "high|medium|low"}]}}\n'
-            "If there are no action items at all, return: {\"action_items\": {}}\n"
-        )
-
-        try:
-            print(f"[Action Items] Extracting for {len(user_map)} users...")
-            extraction_response = client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=extraction_prompt,
-            )
-            raw = extraction_response.text.strip()
-            print(f"[Action Items] Raw AI response: {raw[:500]}")
-
-            # Parse JSON — handle markdown code blocks
-            if raw.startswith("```"):
-                raw = re.sub(r'^```(?:json)?\s*', '', raw)
-                raw = re.sub(r'\s*```$', '', raw)
-
-            parsed = json.loads(raw)
-            action_items = parsed.get("action_items", {})
-            print(f"[Action Items] Found items for {len(action_items)} users")
-
-            workspace_id = meeting["workspace_id"]
-
-            for user_id, tasks in action_items.items():
-                if not tasks or not isinstance(tasks, list):
-                    continue
-
-                print(f"[Action Items] Creating {len(tasks)} tickets for user {user_id}")
-
-                # Load user's existing board
-                board = boards_collection.find_one(
-                    {"workspace_id": workspace_id, "user_id": user_id}
-                )
-
-                existing_tickets = board.get("tickets", []) if board else []
-                existing_columns = board.get("columns", {}) if board else {}
-                existing_order = board.get("execution_order", []) if board else []
-
-                # Find next ticket ID
-                max_id = max((t["id"] for t in existing_tickets), default=0)
-
-                new_tickets = []
-                new_columns = dict(existing_columns)
-
-                for item in tasks:
-                    if not isinstance(item, dict) or "task" not in item:
-                        continue
-                    max_id += 1
-                    ticket = {
-                        "id": max_id,
-                        "task": item["task"],
-                        "deadline": "",
-                        "priority": item.get("priority", "medium"),
-                        "dependency": 0,
-                        "status": "pending",
-                    }
-                    new_tickets.append(ticket)
-                    new_columns[str(max_id)] = "created"
-
-                if new_tickets:
-                    all_tickets = existing_tickets + new_tickets
-                    boards_collection.update_one(
-                        {"workspace_id": workspace_id, "user_id": user_id},
-                        {"$set": {
-                            "workspace_id": workspace_id,
-                            "user_id": user_id,
-                            "tickets": all_tickets,
-                            "columns": new_columns,
-                            "execution_order": existing_order,
-                        }},
-                        upsert=True,
-                    )
-                    tickets_created += len(new_tickets)
-                    print(f"[Action Items] Saved {len(new_tickets)} tickets for user {user_id}")
-
-        except json.JSONDecodeError as e:
-            print(f"[Action Item Parse Error] {e}")
-        except Exception as e:
-            print(f"[Action Item Extraction Error] {type(e).__name__}: {e}")
 
     meetings_collection.update_one(
         {"_id": ObjectId(meeting_id)},
@@ -254,7 +134,7 @@ def end_meeting(meeting_id: str, authorization: str = Header(None)):
         "message": "Meeting ended",
         "ai_summary": ai_summary,
         "notes_count": len(notes),
-        "tickets_created": tickets_created,
+        "actions_applied": len(applied),
     }
 
 
@@ -318,6 +198,7 @@ def meeting_history(authorization: str = Header(None)):
             "transcript": transcript_lines,
             "ai_summary": m.get("ai_summary", ""),
             "notes_count": len(notes),
+            "activity": public_activity(m),
         })
 
     return {"meetings": meetings}
@@ -326,8 +207,8 @@ def meeting_history(authorization: str = Header(None)):
 # ─── User Endpoints ──────────────────────
 
 @router.post("/meetings/notes")
-def add_meeting_note(data: MeetingNote, authorization: str = Header(None)):
-    """Add a transcription note to an active meeting."""
+def add_meeting_note(data: MeetingNote, background: BackgroundTasks, authorization: str = Header(None)):
+    """Add a note to an active meeting; the AI turns it into board actions in the background."""
     user = verify_token(authorization)
 
     meeting = meetings_collection.find_one({"_id": ObjectId(data.meeting_id)})
@@ -337,17 +218,28 @@ def add_meeting_note(data: MeetingNote, authorization: str = Header(None)):
     if meeting["status"] != "active":
         raise HTTPException(status_code=400, detail="Meeting is not active")
 
+    workspace = workspaces_collection.find_one({"_id": ObjectId(meeting["workspace_id"])})
+    if not workspace or user["user_id"] not in workspace.get("members", []):
+        raise HTTPException(status_code=403, detail="Not a member of this workspace")
+
+    text = data.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Note is empty")
+
     note = {
+        "id": uuid.uuid4().hex,
         "user_id": user["user_id"],
         "user_email": user["email"],
-        "text": data.text.strip(),
+        "text": text,
         "timestamp": datetime.utcnow().strftime("%H:%M:%S"),
+        "processed": False,
     }
 
     meetings_collection.update_one(
         {"_id": ObjectId(data.meeting_id)},
         {"$push": {"notes": note}}
     )
+    background.add_task(process_note, data.meeting_id, note["id"])
 
     return {"message": "Note added", "note": note}
 
@@ -383,3 +275,58 @@ def get_active_meetings(authorization: str = Header(None)):
         })
 
     return {"meetings": meetings}
+
+
+def _meeting_for_member(meeting_id: str, authorization: str):
+    """Load a meeting the caller can see: a member of its workspace, or the admin."""
+    user = verify_token(authorization)
+    try:
+        meeting = meetings_collection.find_one({"_id": ObjectId(meeting_id)})
+    except Exception:
+        meeting = None
+    if not meeting:
+        raise HTTPException(status_code=404, detail="Meeting not found")
+    workspace = workspaces_collection.find_one({"_id": ObjectId(meeting["workspace_id"])})
+    db_user = users_collection.find_one({"email": user["email"]}) or {}
+    if not db_user.get("is_admin") and (not workspace or user["user_id"] not in workspace.get("members", [])):
+        raise HTTPException(status_code=403, detail="Not a member of this workspace")
+    return user, meeting
+
+
+@router.get("/meetings/{meeting_id}/activity")
+def get_meeting_activity(meeting_id: str, authorization: str = Header(None)):
+    """Live feed of board changes made from what was said in the meeting."""
+    _, meeting = _meeting_for_member(meeting_id, authorization)
+    notes = meeting.get("notes", [])
+    return {
+        "status": meeting["status"],
+        "activity": public_activity(meeting),
+        "notes": [{"id": n.get("id"), "user": n["user_email"], "text": n["text"], "time": n["timestamp"],
+                   "processed": n.get("processed", True)} for n in notes[-30:]],
+    }
+
+
+@router.post("/meetings/{meeting_id}/activity/{activity_id}/undo")
+def undo_meeting_activity(meeting_id: str, activity_id: str, authorization: str = Header(None)):
+    """Revert one automatic board change."""
+    user, meeting = _meeting_for_member(meeting_id, authorization)
+    workspace_id = meeting["workspace_id"]
+
+    with workspace_lock(workspace_id):
+        meeting = meetings_collection.find_one({"_id": ObjectId(meeting_id)})
+        idx = next((i for i, a in enumerate(meeting.get("activity", [])) if a["id"] == activity_id), None)
+        if idx is None:
+            raise HTTPException(status_code=404, detail="Activity not found")
+        entry = meeting["activity"][idx]
+        if entry["status"] != "applied":
+            raise HTTPException(status_code=400, detail=f"This change is {entry['status']}, nothing to undo")
+        try:
+            undo_activity(workspace_id, entry)
+        except Skip as s:
+            raise HTTPException(status_code=409, detail=str(s))
+        meetings_collection.update_one(
+            {"_id": ObjectId(meeting_id)},
+            {"$set": {f"activity.{idx}.status": "undone", f"activity.{idx}.undone_by": user["email"]}}
+        )
+
+    return {"message": f"Undone: {entry['summary']}"}
